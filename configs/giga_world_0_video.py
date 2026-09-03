@@ -21,6 +21,11 @@ config = dict(
                 height=480,
                 width=640,
                 fps=16,
+                # Sample fixed-rate temporal snippets so the VLA sees a
+                # consistent horizon across episodes. Set ``sampling_mode``
+                # to ``'uniform'`` to reproduce the legacy full-video policy.
+                sampling_mode='fixed_fps',
+                random_start=True,
                 image_cfg=dict(
                     mask_generator=dict(
                         max_ref_frames=1,

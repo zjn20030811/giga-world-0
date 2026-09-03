@@ -3,11 +3,12 @@ import functools
 import torch
 from diffusers.models import AutoencoderKLWan
 from einops import rearrange
+from giga_models import GigaWorld0Transformer3DModel, LoRAPeftWrapper
+from giga_models.nn import EDMLoss
 from giga_train import ModuleDict, Trainer
 from peft import LoraConfig
 
-from giga_models import GigaWorld0Transformer3DModel, LoRAPeftWrapper
-from giga_models.nn import EDMLoss
+from .loss_utils import compute_masked_edm_loss
 
 
 class GigaWorld0Trainer(Trainer):
@@ -116,7 +117,10 @@ class GigaWorld0Trainer(Trainer):
         denoised_latents = self.edm_loss.denoise(model_pred.float())
         if 'ref_images' in batch_dict:
             denoised_latents = ref_masks * ref_latents + (1 - ref_masks) * denoised_latents
-        loss = self.edm_loss.compute_loss(denoised_latents)
+        # ``latent_mask`` is emitted by the fixed-rate sampler. It excludes
+        # latents made entirely from edge-padded frames in short episodes,
+        # preventing those repeated frames from biasing the diffusion target.
+        loss = compute_masked_edm_loss(self.edm_loss, denoised_latents, batch_dict.get('latent_mask'))
         return loss
 
     def forward_vae(self, images):

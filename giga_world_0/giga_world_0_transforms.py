@@ -1,13 +1,15 @@
 import copy
+import math
 import random
 
-import numpy as np
 import torch
 from giga_datasets import video_utils
 from giga_train import TRANSFORMS
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
+
+from .temporal_sampling import frame_mask_to_latent_mask, sample_temporal_window, sample_uniform_window
 
 
 @TRANSFORMS.register
@@ -17,7 +19,18 @@ class GigaWorld0Transform:
     Handles video sampling, resizing, cropping, normalization, and reference frame generation.
     """
 
-    def __init__(self, num_frames: int, height: int, width: int, image_cfg: dict, fps: int = 16):
+    def __init__(
+        self,
+        num_frames: int,
+        height: int,
+        width: int,
+        image_cfg: dict,
+        fps: int = 16,
+        sampling_mode: str = 'fixed_fps',
+        random_start: bool = True,
+        source_fps: float | None = None,
+        seed: int | None = None,
+    ):
         """Initialize the transform.
 
         Args:
@@ -25,15 +38,55 @@ class GigaWorld0Transform:
             height: Target height for the output frames.
             width: Target width for the output frames.
             image_cfg: Configuration dictionary containing mask generator settings.
-            fps: Frames per second for the video (default: 16).
+            fps: Frames per second for the sampled training window (default: 16).
+            sampling_mode: Temporal sampling policy. ``'fixed_fps'`` samples a
+                constant-rate window and is the default; ``'uniform'`` keeps
+                the original full-episode ``linspace`` behaviour.
+            random_start: Randomize the beginning of fixed-rate windows. When
+                false, windows start at frame zero.
+            source_fps: Optional native video rate. If omitted, the transform
+                reads ``video.fps`` or ``data_dict['video_fps']`` when
+                available and falls back to ``fps``.
+            seed: Optional local seed for temporal, crop, and reference-mask
+                randomness.
         """
         self.num_frames = num_frames
         self.height = height
         self.width = width
         self.fps = fps
+        self.sampling_mode = sampling_mode.lower()
+        if self.sampling_mode not in {'fixed_fps', 'uniform'}:
+            raise ValueError("sampling_mode must be either 'fixed_fps' or 'uniform'")
+        self.random_start = random_start
+        self.source_fps = source_fps
+        self.rng = random.Random(seed) if seed is not None else random
         # Normalization transform: convert [0, 1] to [-1, 1]
         self.normalize = transforms.Normalize([0.5], [0.5])
         self.mask_generator = MaskGenerator(**image_cfg['mask_generator'])
+
+    def _get_source_fps(self, video, data_dict: dict) -> float:
+        """Resolve the native frame rate used to construct timestamps."""
+
+        candidates = [self.source_fps, data_dict.get('video_fps'), data_dict.get('source_fps')]
+        # VideoReaderDecord and VideoReaderCV2 both expose ``fps``. A malformed
+        # codec value should not make an otherwise usable sample fail; the
+        # configured target rate is a safe one-frame-per-step fallback in that
+        # case. Keep this candidate even when an invalid explicit override was
+        # supplied so metadata can still recover the sample.
+        try:
+            candidates.append(video.fps)
+        except (AttributeError, RuntimeError, ValueError, TypeError):
+            pass
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            try:
+                candidate = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(candidate) and candidate > 0:
+                return candidate
+        return float(self.fps)
 
     def __call__(self, data_dict):
         """Apply transformations to the input data.
@@ -45,9 +98,25 @@ class GigaWorld0Transform:
             new_data_dict: Transformed data dictionary with processed images and masks.
         """
         video = data_dict['video']
-        video_legnth = len(video)
-        sample_indexes = np.linspace(0, video_legnth - 1, self.num_frames, dtype=int)
-        input_images = video_utils.sample_video(video, sample_indexes, method=2)
+        video_length = len(video)
+        source_fps = self._get_source_fps(video, data_dict)
+        if self.sampling_mode == 'fixed_fps':
+            sample_indexes, frame_valid = sample_temporal_window(
+                video_length,
+                self.num_frames,
+                target_fps=self.fps,
+                source_fps=source_fps,
+                random_start=self.random_start,
+                rng=self.rng,
+            )
+        else:
+            sample_indexes, frame_valid = sample_uniform_window(video_length, self.num_frames)
+        # Fixed-rate windows are usually far shorter than an episode. Use the
+        # reader's direct batched path so a late random window does not decode
+        # every preceding frame; retain method 2 for the legacy policy.
+        strictly_increasing = bool((sample_indexes[1:] > sample_indexes[:-1]).all())
+        sample_method = 1 if self.sampling_mode == 'fixed_fps' and strictly_increasing else 2
+        input_images = video_utils.sample_video(video, sample_indexes, method=sample_method)
         # Convert to tensor and rearrange dimensions: (T, H, W, C) -> (T, C, H, W)
         input_images = torch.from_numpy(input_images).permute(0, 3, 1, 2).contiguous()
 
@@ -64,8 +133,8 @@ class GigaWorld0Transform:
             new_width = int(round(float(dst_height) / image_height * image_width))
 
         # Random crop coordinates
-        x1 = random.randint(0, new_width - dst_width)
-        y1 = random.randint(0, new_height - dst_height)
+        x1 = self.rng.randint(0, new_width - dst_width)
+        y1 = self.rng.randint(0, new_height - dst_height)
 
         # Apply resize and crop
         input_images = F.resize(input_images, (new_height, new_width), InterpolationMode.BILINEAR)
@@ -79,7 +148,7 @@ class GigaWorld0Transform:
 
         # ===== Generate Reference Images and Masks =====
         # Get masks for reference frames
-        ref_masks, ref_latent_masks = self.mask_generator.get_mask(input_images.shape[0])
+        ref_masks, ref_latent_masks = self.mask_generator.get_mask(input_images.shape[0], rng=self.rng)
         # Expand dimensions for broadcasting: (T,) -> (T, 1, 1, 1)
         ref_masks = ref_masks[:, None, None, None]
         # Expand for latent space: (T_latent,) -> (1, T_latent, 1, 1)
@@ -88,11 +157,21 @@ class GigaWorld0Transform:
         ref_images = copy.deepcopy(input_images)
         ref_images = ref_images * ref_masks
 
+        # The VAE has one temporal anchor latent followed by groups of frames.
+        # Keep both masks: ``frame_mask`` is useful to data consumers, while
+        # ``latent_mask`` lets the trainer exclude padded tail latents from the
+        # diffusion objective.
+        frame_mask = torch.from_numpy(frame_valid)
+        latent_mask = torch.from_numpy(frame_mask_to_latent_mask(frame_valid, self.mask_generator.factor))
+
         new_data_dict = dict(
             fps=self.fps,
             images=input_images,
             ref_images=ref_images,
             ref_masks=ref_latent_masks,
+            frame_mask=frame_mask,
+            latent_mask=latent_mask,
+            sample_indices=torch.from_numpy(sample_indexes),
             prompt_embeds=data_dict['prompt_embeds'],
         )
         return new_data_dict
@@ -120,7 +199,7 @@ class MaskGenerator:
         self.max_ref_latents = 1 + (max_ref_frames - 1) // factor
         assert self.start <= self.max_ref_latents
 
-    def get_mask(self, num_frames: int):
+    def get_mask(self, num_frames: int, rng=None):
         """Generate binary masks for reference frames and latents.
 
         Args:
@@ -138,8 +217,14 @@ class MaskGenerator:
         # Calculate number of latents based on downsampling factor
         num_latents = 1 + (num_frames - 1) // self.factor
 
-        # Randomly select number of reference latents
-        num_ref_latents = random.randint(self.start, self.max_ref_latents)
+        # Randomly select number of reference latents. Accepting an injected
+        # RNG keeps seeded transforms reproducible without changing callers
+        # that rely on the module-level random generator.
+        rng = random if rng is None else rng
+        if hasattr(rng, 'integers'):
+            num_ref_latents = int(rng.integers(self.start, self.max_ref_latents + 1))
+        else:
+            num_ref_latents = rng.randint(self.start, self.max_ref_latents)
 
         # Calculate corresponding number of reference frames
         if num_ref_latents > 0:
